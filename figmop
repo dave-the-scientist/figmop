@@ -1,0 +1,359 @@
+#!/usr/bin/env python
+import os, sys, subprocess
+import xml.etree.ElementTree as ET
+from optparse import OptionParser, OptionGroup
+from molecbio import sequ
+from patternHmm import generate_model_file
+
+
+__author__ = 'David Curran'
+__version__ = '0.2'
+
+
+def run_mast(memeFile, seqFile, outputDir, eValue):
+    if not os.path.isdir(outputDir):
+        os.makedirs(outputDir)
+    args = ['mast', memeFile, seqFile, '-oc', outputDir, '-dna', '-ev', str(float(eValue))]
+    print 'Starting MAST with the command:', ' '.join(args)
+    try:
+        retcode = subprocess.call(args)
+        if retcode != 0:
+            raise RuntimeError("MAST returned with the abnormal code %i"%retcode)
+    except OSError:
+        raise RuntimeError("FiGMoP requires that 'mast' is installed and available from the command line")
+
+
+class MotifPatterns(object):
+    """Parses the results of running MAST on some sequence file, searching for the
+    patterns defined by the model argument. Any patterns detected can be printed
+    with the print_patterns() method, or the sequences corresponding to those
+    patterns can be extracted, and have MAST run on them using the
+    run_mast_on_patterns() method. This class takes a minimum of 2 arguments on
+    instanciation, the path to some MAST output, and a model describing some pattern
+    of motifs. It also allows for a specified minimum number of motifs in a valid
+    pattern, and the path to the sequence file that generated the given MAST output.
+    This software works with MAST version 4.5.0; it may not with other versions."""
+    def __init__(self, mastFile, model, sequenceFile=None, min_matches=None,
+                 sequence_padding=0):
+        self.min_matches = min_matches
+        self.seq_pad = sequence_padding
+        self.motifLengths = {}
+        self.sequences = {}
+        mastFile = self._validateMastPath(mastFile)
+        self._parseMastFile(mastFile)
+        if sequenceFile:
+           self.sequenceFile = sequenceFile 
+        self._findPatterns(model)
+
+    # # # # #  Public Methods  # # # # #
+    def run_mast_on_patterns(self, memeFile, maxSize=40000, e_value=10.0,
+                          outputDir='mast_out', outputSeqsFilename=False):
+        seqNames = tuple(seq for seq in self.sequences if self.sequences[seq]['matches'])
+        if not seqNames:
+            print "Error: Cannot run MAST, as there were no matches found to the given model."
+            return False
+        seqsDict = self._generateSeqsDict(self.sequenceFile, seqNames)
+        if not seqsDict: return False
+        tempSeqFile = self._writeTempSequenceFile(outputDir, seqNames, seqsDict, maxSize)
+        run_mast(memeFile, tempSeqFile, outputDir, e_value)
+        print 'Finished running MAST, cleaning up files...'
+        if outputSeqsFilename: 
+            self._outputMastHits(tempSeqFile, outputSeqsFilename, outputDir)
+        os.remove(tempSeqFile)
+    
+    def print_patterns(self):
+        """Prints the patterns found by the model in the MAST results."""
+        numSeqs, totalMatches = 0, 0
+        for seqName in sorted(self.sequences):
+            numMatches = len(self.sequences[seqName]['matches'])
+            if numMatches == 0: continue
+            totalMatches += numMatches
+            numSeqs += 1
+            s = '\nFound %i matches in %s' % (numMatches, seqName)
+            print s
+            print '-' * len(s)
+            for (start, end), states, seq in self.sequences[seqName]['matches']:
+                self._printMatch(start, end, states, seq)
+        print '\nFound %i matches total in %i sequences.\n' % (totalMatches, numSeqs)
+
+    # # # # #  Private Methods  # # # # #
+    def _findPatterns(self, model):
+        """Fills out the 'matches' attribute for each entry in the
+        self.sequences object by searching for motif patterns using
+        the hidden Markov model."""
+        found = 0
+        print "Searching MAST output for patterns..."
+        for atts in self.sequences.values():
+            matches = model.find_matches(atts['sequence'], minimumMatches=self.min_matches,
+                                         cleanSequence=False)
+            negMatches = model.find_matches(atts['negSequence'], minimumMatches=self.min_matches,
+                                            cleanSequence=False)
+            atts['matches'] = self._parseBoundaries(matches, negMatches, atts)
+            found += len(atts['matches'])
+        print "Found %i total matches that satisfied the pattern." % found
+    def _validateMastPath(self, mastFile):
+        if os.path.isfile(mastFile):
+            if mastFile.endswith('.xml'):
+                return os.path.abspath(mastFile)
+            mastFile = os.path.dirname(mastFile)
+        if os.path.isdir(mastFile):
+            contents = os.listdir(mastFile)
+            for fname in contents:
+                if fname.endswith('.xml'):
+                    return os.path.abspath(os.path.join(mastFile, fname))
+        raise IOError("Could not find a suitable MAST output .xml at or around %s" % mastFile)
+
+    # # #  Outputting Methods
+    def _printMatch(self, start, end, states, seq):
+        maxWidth = max(map(len, seq))
+        strFmt = '%%%is' % maxWidth
+        s = '(%i) ' % start
+        e = ' (%i)' % end
+        states = ' '*len(s) + ','.join(strFmt % state for state in states) + ' '*len(e)
+        seq = s + ','.join(strFmt % symb for symb in seq) + e
+        for i in xrange(0, len(seq), 60):
+            print seq[i:i+60]
+            print states[i:i+60]
+            print
+    # # #  Parsing results
+    def _parseBoundaries(self, matches, negMatches, atts):
+        allMatches = []
+        def calcBoundaries(states, ind, seq, starts):
+            start = starts[ind]
+            end = starts[ind + len(seq) - 1] + self.motifLengths[seq[-1]]
+            return ((start, end), states, seq)
+        def calcNegBoundaries(states, ind, seq, starts):
+            start = starts[ind]
+            end = starts[ind + len(seq) - 1] - self.motifLengths[seq[-1]]
+            return ((start, end), states, seq)
+        for states, (ind, seq) in zip(*matches):
+            allMatches.append(calcBoundaries(states, ind, seq, atts['starts']))
+        for states, (ind, seq) in zip(*negMatches):
+            allMatches.append(calcNegBoundaries(states, ind, seq, atts['negStarts']))
+        return allMatches
+
+    def _parseMastFile(self, mastFile):
+        """Fills out self.sequences self.motifLengths, and self.sequenceFile."""
+        try:
+            data = ET.parse(mastFile).getroot()
+            motifs = data.find('motifs')
+            self.motifLengths = dict((m.attrib['num'], 3*int(m.attrib['width']))
+                                     for m in motifs.findall('motif'))
+            self.sequences = {}
+            seqs = data.find('sequences')
+            self.sequenceFile = seqs.find('database').attrib['source']
+            for sequence in seqs.findall('sequence'):
+                seq_name = sequence.attrib['name']
+                comment = sequence.attrib.get('comment', None)
+                if comment: seq_name = ' '.join((seq_name, comment))
+                for_seq = []; neg_seq = []
+                for_starts = []; neg_starts = []
+                for seg in sequence.findall('seg'):
+                    for hit in seg.findall('hit'):
+                        strand = hit.attrib['strand']
+                        pos = int(hit.attrib['pos']) - 1
+                        m = hit.attrib['motif'][6:]
+                        if strand == 'forward':
+                            for_seq.append(m)
+                            for_starts.append(pos)
+                        else:
+                            neg_seq.append(m)
+                            neg_starts.append(pos + self.motifLengths[m])
+                self.sequences[seq_name] = {'sequence':for_seq, 'negSequence':neg_seq[::-1],
+                                        'starts':for_starts, 'negStarts':neg_starts[::-1]}
+        except:
+            print "\nIOError: encountered the following error attempting to parse the MAST .xml file at %s" % mastFile
+            raise
+        
+    # # #  Methods to run MAST.
+    def _generateSeqsDict(self, sequenceFile, seqNames):
+        seqsDict = {}
+        print 'Loading sequences from %s...\n' % sequenceFile
+        sequences = sequ.loadfasta(sequenceFile, onlyThese=seqNames)
+        for seqname in seqNames:
+            for seq in sequences:
+                if seq.header == seqname:
+                    seqsDict[seqname] = seq.sequence
+                    break
+            else:
+                print "Error: A sequence named '%s' was found in the MAST results but could not be found in the sequence file %s." % (seqname, sequenceFile)
+                return False
+        return seqsDict
+    def _writeTempSequenceFile(self, outputDir, seqNames, seqsDict, maxSize):
+        buff = []
+        tempName = 'temp_mast_seq_file'
+        for seqName in seqNames:
+            for i, match in enumerate(self.sequences[seqName]['matches']):
+                start, end = sorted(match[0])
+                if (end - start) > maxSize:
+                    continue
+                start = max(0, start-self.seq_pad)
+                end = min(len(seqsDict[seqName]), end+self.seq_pad)
+                buff.append('>%s_%i\n%s\n' % (seqName, i+1, seqsDict[seqName][start:end]))
+        if not os.path.isdir(outputDir): os.makedirs(outputDir)
+        tempName = outputDir + '/' + tempName
+        if os.path.isfile(tempName + '.fa'):
+            i = 1
+            while os.path.isfile(tempName + '_%i.fa'%i): i += 1
+            tempName += '_%i.fa'%i
+        else: tempName += '.fa'
+        with open(tempName, 'wb') as f:
+            f.write(''.join(buff))
+        return tempName
+    def _getMastHitNames(self, mastFile):
+        data = ET.parse(mastFile).getroot()
+        seqs = data.find('sequences')
+        names = [("%s %s"%(seq.attrib['name'], seq.attrib['comment'])).strip() for seq in seqs.findall('sequence')]
+        return names
+    def _outputMastHits(self, tempSeqFile, outputSeqsFilename, outputDir):
+        buff = []
+        seqs = sequ.loadfasta(tempSeqFile)
+        mastFile = os.path.join(outputDir, 'mast.xml')
+        hitNames = self._getMastHitNames(mastFile)
+        for name in hitNames:
+            for seq in seqs:
+                if seq.header == name:
+                    name, _, num = name.rpartition('_')
+                    start,end = self.sequences[name]['matches'][int(num)-1][0]
+                    
+                    if start < end:
+                        sequence = seq.seq
+                        start = max(0, start-self.seq_pad)
+                        end = start + len(sequence) - 1
+                    else:
+                        sequence = seq.invcomplement()
+                        end = max(0, end-self.seq_pad)
+                        start = end + len(sequence) - 1
+                    
+                    """
+                    if start < end:
+                        end -= 1
+                        sequence = seq.seq
+                    else:
+                        start -= 1
+                        sequence = seq.invcomplement()
+                    """    
+                    buff.append('>%s_%i-%i\n%s\n' % (name, start, end, sequence))
+                    break
+            else:
+                print "Couldn't find sequence named %s in %s." % (name, tempSeqFile)
+                return False
+        outFile = os.path.join(outputDir, outputSeqsFilename)
+        with open(outFile, 'wb') as f:
+            f.write(''.join(buff))
+        print "\nWrote %i sequences to %s\n" % (len(buff), outFile)
+
+
+# # # # # # # # # #  Command Line Wrapper  # # # # # # # # # #
+def setup_parser():
+    usage = "First run MEME on some sequences, then generate a model file with:\n\t%prog --generate_model_file LENGTH [options]\n\nFill out this model file, replacing the default strings in the 'matchEmissions' dict with the motif numbers of your desired pattern. Then run FigMoP with:\n\t%prog model_file genome_file genome_mast_dir [options]"
+    parser = OptionParser(usage=usage)
+    parser.set_defaults(output_dir='mast_out', e_value=10.0, hits_filename='hits.fa',
+                        sequence_padding=0, default_mast_xml='mast.xml',
+                        max_genome_region=0, min_matches=0, meme_file='',
+                        make_model=0, new_model_path='model_file.py')
+
+    parser.add_option('-o', '--output_dir', dest='output_dir',
+                      metavar='DIR', help='write output to DIR [default: %default]')
+    parser.add_option('-e', '--e_value', dest='e_value', type='float',
+                      help='max E-value for hits [default: %default] NOTE: this is derived from the length of the gene and the quality of the motif matches. It has nothing to do with adherance to the pattern.')
+    parser.add_option('-p', '--sequence_padding', dest='sequence_padding',
+                      type='int', metavar='LENGTH',
+                      help='save and additional LENGTH bp on either side of a match')
+    parser.add_option('-n', '--hits_filename', dest='hits_filename',
+                      help='name for the file containing fasta formatted hits [default: %default]')
+    parser.add_option('-x', '--default_mast_xml', dest='default_mast_xml', metavar='FILENAME',
+                      help='default name of the MAST output xml file [default: %default]')
+    
+    model_group = OptionGroup(parser, 'Model options', 'These are typically set in the model file. Any options set here will override those in the model file.')
+    model_group.add_option('-m', '--min_matches', type='int', dest='min_matches',
+                           help='minimum number of motifs to qualify as a hit [default: half the length of the pattern]')
+    model_group.add_option('-l', '--max_genome_region', type='int', dest='max_genome_region',
+                           help='a hit must be shorter than this on the genome [default: 40000 bp]')
+    model_group.add_option('--meme_file', dest='meme_file',
+                           help='path to a meme.txt file to use with the model')
+    parser.add_option_group(model_group)
+    
+    make_model = OptionGroup(parser, 'Generate a model file', "To generate a model file, supply the --generate_model_file flag with some length, and optionally a file name. Also, any of the 'Model options' given will be filled out as default values in the model file. This will not run FiGMoP.")
+    make_model.add_option('-g', '--generate_model_file', type='int',
+                          dest='make_model', metavar='LENGTH',
+                          help='generate a model file for a pattern of LENGTH motifs')
+    make_model.add_option('-f', '--model_filepath', dest='new_model_path',
+                          help='where to write the model file [default: %default]')
+    parser.add_option_group(make_model)
+    return parser
+
+def validate_model_options(parser, options):
+    mm = options.min_matches
+    mgr = options.max_genome_region
+    mf = options.meme_file
+    if mm and mm < 0: parser.error('min_matches must be >= 0')
+    if mgr < 0: parser.error('max_genome_region must be > 0, and is typically >> 1000')
+    if mf:
+        if not (os.path.isfile(mf) and mf.endswith('.txt')): parser.error('meme_file must be the .txt file generated by MEME')
+        mf = os.path.realpath(mf)
+    return mm, mgr, mf
+
+def validate_run_options(parser, args):
+    if len(args) != 3: parser.error('wrong number of arguments passed')
+    model_file, genome_file, genome_mast_dir = args
+    model_file = os.path.realpath(model_file)
+    if not model_file.endswith('.py') or not os.path.isfile(model_file):
+        parser.error('model_file must be a valid patternHmm model file.')
+    try:
+        model_path, model_name = os.path.split(model_file)
+        sys.path.append(model_path)
+        model_module = __import__(model_name[:-3])
+    except (ImportError, AttributeError):
+        parser.error("the model could not be imported from %s."%model_file)
+    if not os.path.isfile(genome_file): parser.error('genome_file must point at a fasta formatted sequence file')
+    return model_module, genome_file, os.path.realpath(genome_mast_dir)
+
+def create_model_file(model_len, model_path, min_matches, max_genome_region, meme_file):
+    if max_genome_region == 0: max_genome_region = 40000
+    mm_str = 'min_matches = %i' % min_matches
+    ms_str = 'max_genome_region = %i' % max_genome_region
+    mf_str = "meme_file = '%s'" % meme_file
+    attribs_str = '\n'.join((mm_str, ms_str, mf_str))
+    generate_model_file(model_len, model_path, attribs_str)
+
+def main():
+    parser = setup_parser()
+    (options, args) = parser.parse_args()
+
+    # Validate options and arguments
+    min_matches, max_genome_region, meme_file = validate_model_options(parser, options)
+    new_model_len = options.make_model
+    if new_model_len: # Generate model file or run FiGMoP?
+        if new_model_len < 2:
+            parser.error('the length of the model file must be > 1')
+        create_model_file(new_model_len, options.new_model_path, min_matches, max_genome_region, meme_file)
+        return
+
+    sequence_padding = options.sequence_padding
+    if sequence_padding < 0: parser.error('sequence_padding must be >= 0')
+    e_value = options.e_value
+    if e_value <= 0: parser.error('e_value must be >= 0')
+    model_module, genome_file, genome_mast_dir = validate_run_options(parser, args)
+    model = model_module.model
+    if not min_matches:
+        min_matches = getattr(model_module, 'min_matches', 0)
+    if not max_genome_region:
+        max_genome_region = getattr(model_module, 'max_genome_region', 40000)
+    if not meme_file:
+        meme_file = getattr(model_module, 'meme_file', '')
+        if not meme_file or not os.path.isfile(meme_file):
+            parser.error("a MEME file must be provided in the model file or at the command line, but none was found at '%s'" % meme_file)
+
+    if not os.path.isdir(genome_mast_dir) or not os.path.isfile(os.path.join(genome_mast_dir, options.default_mast_xml)):  # Run MAST on the genome before running FiGMoP
+        print "\nRunning MAST on the sequence file '%s' using the motifs from the MEME file '%s'\n" % (genome_file, meme_file)
+        run_mast(meme_file, genome_file, genome_mast_dir, 1000)
+    # Run FiGMoP
+    print "\nRunning FiGMoP on the genomic motifs from '%s' using the model file '%s'\n" % (genome_mast_dir, args[0])
+    patterns = MotifPatterns(genome_mast_dir, model, genome_file, min_matches,
+                                    sequence_padding)
+    patterns.run_mast_on_patterns(meme_file, max_genome_region, e_value,
+                                  options.output_dir, options.hits_filename)
+
+if __name__ == "__main__":
+    main()
