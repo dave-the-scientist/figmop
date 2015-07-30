@@ -1,7 +1,7 @@
 ======
 Figmop
 ======
-Version 1.0
+Version 1.1
 
 This script uses the patternHmm Python package to identify genes in a raw 
 genome sequence, after training a profile hidden Markov model on protein 

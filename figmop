@@ -5,27 +5,34 @@ from optparse import OptionParser, OptionGroup
 from patternHmm import generate_model_file
 
 # TO DO:
-#-- Add option to run on protein sequences. (code exists in GSTs/seqs_from_mast.py)
 #-- Add options to modify default transition probs when generating pattern file.
 #   -- Perhaps: -MI 0.2 to specify that match to insert should be 0.2 instead of 0.3.
 #-- Incorporate the strength of each motif into pHMM.
 #-- Why are nearby patterns merged? looks like 214_1 is a good pattern merged with a bad one. Don't want this behaviour.
 
 __author__ = 'David Curran'
-__version__ = '1.0'
+__version__ = '1.1'
 
 
-def run_mast(memeFile, seqFile, outputDir, eValue):
+def run_mast(memeFile, seqFile, outputDir, eValue, dnaSeq=True):
     if not os.path.isdir(outputDir):
         os.makedirs(outputDir)
-    args = ['mast', memeFile, seqFile, '-oc', outputDir, '-dna', '-ev', str(float(eValue))]
-    print 'Starting MAST with the command:', ' '.join(args)
+    args = ['mast', memeFile, seqFile, '-oc', outputDir, '-ev', str(float(eValue))]
+    if dnaSeq: args.append('-dna')
+    print '\nStarting MAST with the command:', ' '.join(args)
     try:
         retcode = subprocess.call(args)
         if retcode != 0:
             raise RuntimeError("MAST returned with the abnormal code %i"%retcode)
     except OSError:
-        raise RuntimeError("FiGMoP requires that 'mast' is installed and available from the command line")
+        raise RuntimeError("Figmop requires that 'mast' is installed and available from the command line")
+def create_pattern_file(model_len, model_path, min_matches, max_genome_region, meme_file):
+    if max_genome_region == 0: max_genome_region = 40000
+    mm_str = 'min_matches = %i' % min_matches
+    ms_str = 'max_genome_region = %i' % max_genome_region
+    mf_str = "meme_file = '%s'" % meme_file
+    attribs_str = '\n'.join((mm_str, ms_str, mf_str))
+    generate_model_file(model_len, model_path, attribs_str)
 
 
 class MotifPatterns(object):
@@ -148,9 +155,7 @@ class MotifPatterns(object):
             seqs = data.find('sequences')
             self.sequenceFile = seqs.find('database').attrib['source']
             for sequence in seqs.findall('sequence'):
-                seq_name = sequence.attrib['name']
-                comment = sequence.attrib.get('comment', None)
-                if comment: seq_name = ' '.join((seq_name, comment))
+                seq_name = ' '.join(( "%s %s"%(sequence.attrib['name'], sequence.attrib.get('comment', '')) ).split())
                 for_seq = []; neg_seq = []
                 for_starts = []; neg_starts = []
                 for seg in sequence.findall('seg'):
@@ -253,9 +258,8 @@ def loadfasta(filepath, onlyThese=[]):
                 if buff:
                     seqs[curName] = ''.join(buff)
                     buff = []
-                if not onlyThese or line[1:].startswith(onlyThese):
-                    curName = line[1:].strip()
-                else:
+                curName = ' '.join(line[1:].split())
+                if onlyThese and not curName.startswith(onlyThese):
                     curName = None
             else:
                 if not curName: continue
@@ -266,31 +270,73 @@ def loadfasta(filepath, onlyThese=[]):
     return seqs
 def invcomplement(sequence):
     return ''.join([complement.get(c,'N') for c in sequence.upper()][::-1])
+# # # # # # # # # # #  Functions to parse MAST xml file  # # # # # # # # # # # #
+# In both functions the sequence name is split and forced to be space-separated
+# because MAST sometimes handles spaces and tabs oddly.
+def extract_seqs(mast_dir, seq_file, output_file):
+    mast_xml = os.path.join(mast_dir, 'mast.xml')
+    if not os.path.isfile(mast_xml):
+        print 'Figmop runtime error: could not find a MAST xml file in %s' % mast_dir
+        exit()
+    names = get_names(mast_xml)
+    print 'Loading sequences from %s...' % (seq_file)
+    seqs = loadfasta(seq_file, names)
+    buff = []
+    for name in names:
+        if name not in seqs:
+            print 'Figmop runtime error: the MAST hit %s was not found in the sequence file %s' % (name, seq_file)
+            exit()
+        buff.append('>%s\n%s\n' % (name, seqs[name]))
+    with open(output_file, 'w') as f:
+        f.write('\n'.join(buff))
+    print 'Saved %i sequences to %s' % (len(names), output_file)
+def get_names(mast_xml):
+    data = ET.parse(mast_xml).getroot()
+    seqs = data.find('sequences')
+    names = [' '.join(( "%s %s"%(seq.attrib['name'], seq.attrib.get('comment', '')) ).split()) for seq in seqs.findall('sequence')]
+    return names
 
 
 # # # # # # # # # #  Command Line Wrapper  # # # # # # # # # #
 def setup_parser():
-    usage = "First run MEME on some sequences, then generate a model file with:\n\t%prog --generate_model_file LENGTH [options]\n\nFill out this model file, replacing the default strings in the 'matchEmissions' dict with the motif numbers of your desired pattern. Then run FigMoP with:\n\t%prog model_file genome_file genome_mast_dir [options]"
+    usage = "There are 3 different ways to run Figmop; for more details please read the tutorial file at https://github.com/dave-the-scientist/figmop\n\nRun Figmop on protein sequences with:\n\t%prog MEME_FILE --prot PROT_FILE [options]\n\nGenerate a pattern file with:\n\t%prog --generate_pattern_file LENGTH [options]\n\nRun Figmop on a genome with:\n\t%prog PATTERN_FILE GENOME_FILE GENOME_MAST_DIR [options]"
     version_str = "%%prog %s" % __version__
     parser = OptionParser(usage=usage, version=version_str)
-    parser.set_defaults(output_dir='mast_out', e_value=1.0, hits_filename='hits.fa',
+    parser.set_defaults(output_dir='mast_out', e_value=0.01, hits_filename='hits.fa',
+                        prot_file='',
+                        generate_pattern_file=0, pattern_file_path='pattern_file.py',
                         sequence_padding=0, default_mast_xml='mast.xml',
-                        max_genome_region=0, min_matches=0, meme_file='',
-                        make_model=0, new_model_path='model_file.py')
+                        max_genome_region=0, min_matches=0, meme_file='')
 
     parser.add_option('-o', '--output_dir', dest='output_dir',
                       metavar='DIR', help='write output to DIR [default: %default]')
     parser.add_option('-e', '--e_value', dest='e_value', type='float',
                       help='max E-value for hits [default: %default] NOTE: this is derived from the length of the gene and the quality of the motif matches. It has nothing to do with adherance to the pattern.')
-    parser.add_option('-p', '--sequence_padding', dest='sequence_padding',
-                      type='int', metavar='LENGTH',
-                      help='save and additional LENGTH bp on either side of a match')
     parser.add_option('-n', '--hits_filename', dest='hits_filename',
                       help='name for the file containing fasta formatted hits [default: %default]')
-    parser.add_option('-x', '--default_mast_xml', dest='default_mast_xml', metavar='FILENAME',
-                      help='default name of the MAST output xml file [default: %default]')
     
-    model_group = OptionGroup(parser, 'Model options', 'These are typically set in the model file. Any options set here will override those in the model file.')
+    prot_group = OptionGroup(parser, 'Run on protein sequences', 'To run Figmop on protein sequences supply the --prot flag with some sequence file, followed by the path to some meme.txt file. This mode respects the --output_dir, --e_value, and --hits_filename options. This will run MAST and extract the sequences; as such it does not actually respect any pattern, and so does not require a pattern file.')
+    prot_group.add_option('--prot', dest='prot_file',
+                          help='run Figmop on protein sequences')
+    parser.add_option_group(prot_group)
+    
+    generate_pattern_file = OptionGroup(parser, 'Generate a pattern file', "To generate a pattern file, supply the --generate_pattern_file flag with some length, and optionally a file name. Also, any of the 'Model options' given will be filled out as default values in the pattern file. This will not run Figmop.")
+    generate_pattern_file.add_option('-g', '--generate_pattern_file', type='int',
+                          dest='generate_pattern_file', metavar='LENGTH',
+                          help='generate a pattern file for a pattern of LENGTH motifs')
+    generate_pattern_file.add_option('-f', '--pattern_filepath', dest='pattern_file_path',
+                          help='where to write the pattern file [default: %default]')
+    parser.add_option_group(generate_pattern_file)
+    
+    genome_group = OptionGroup(parser, 'Run on a genome', 'These options are respected when Figmop is run in its default mode, scanning a genome for instances of some sequence pattern.')
+    genome_group.add_option('-p', '--sequence_padding', dest='sequence_padding',
+                      type='int', metavar='LENGTH',
+                      help='save and additional LENGTH bp on either side of a match')
+    genome_group.add_option('-x', '--default_mast_xml', dest='default_mast_xml', metavar='FILENAME',
+                      help='default name of the MAST output xml file [default: %default]')
+    parser.add_option_group(genome_group)
+    
+    model_group = OptionGroup(parser, 'Model options', 'These are typically set in the pattern file. Any options set here will override those in the pattern file.')
     model_group.add_option('-m', '--min_matches', type='int', dest='min_matches',
                            help='minimum number of motifs to qualify as a hit [default: half the length of the pattern]')
     model_group.add_option('-l', '--max_genome_region', type='int', dest='max_genome_region',
@@ -298,17 +344,22 @@ def setup_parser():
     model_group.add_option('--meme_file', dest='meme_file',
                            help='path to a meme.txt file to use with the model')
     parser.add_option_group(model_group)
-    
-    make_model = OptionGroup(parser, 'Generate a model file', "To generate a model file, supply the --generate_model_file flag with some length, and optionally a file name. Also, any of the 'Model options' given will be filled out as default values in the model file. This will not run FiGMoP.")
-    make_model.add_option('-g', '--generate_model_file', type='int',
-                          dest='make_model', metavar='LENGTH',
-                          help='generate a model file for a pattern of LENGTH motifs')
-    make_model.add_option('-f', '--model_filepath', dest='new_model_path',
-                          help='where to write the model file [default: %default]')
-    parser.add_option_group(make_model)
     return parser
 
+def validate_prot_options(prot_file, parser, args):
+    if not os.path.isfile(prot_file):
+        parser.error('no protein sequence file found at %s' % prot_file)
+    if len(args) != 1:
+        parser.error('the MEME_FILE argument must be supplied if the --prot flag is used')
+    meme_file = args[0]
+    if os.path.isdir(meme_file):
+        meme_file = os.path.join(meme_file, 'meme.txt')
+    if not os.path.isfile(meme_file) or not meme_file.endswith('.txt'):
+        parser.error('could not locate a meme.txt file at %s' % meme_file)
+    return os.path.realpath(prot_file), os.path.realpath(meme_file)
 def validate_model_options(parser, options):
+    e_value = options.e_value
+    if e_value <= 0: parser.error('e_value must be >= 0')
     mm = options.min_matches
     mgr = options.max_genome_region
     mf = options.meme_file
@@ -317,50 +368,24 @@ def validate_model_options(parser, options):
     if mf:
         if not (os.path.isfile(mf) and mf.endswith('.txt')): parser.error('meme_file must be the .txt file generated by MEME')
         mf = os.path.realpath(mf)
-    return mm, mgr, mf
-
-def validate_run_options(parser, args):
-    if len(args) != 3: parser.error('wrong number of arguments passed')
-    model_file, genome_file, genome_mast_dir = args
-    model_file = os.path.realpath(model_file)
-    if not model_file.endswith('.py') or not os.path.isfile(model_file):
-        parser.error('model_file must be a valid patternHmm model file.')
+    return e_value, mm, mgr, mf
+def validate_genome_options1(parser, args):
+    if len(args) != 3: parser.error('must supply PATTERN_FILE, GENOME_FILE, and GENOME_MAST_DIR to run Figmop on a genome')
+    pattern_file, genome_file, genome_mast_dir = args
+    pattern_file = os.path.realpath(pattern_file)
+    if not pattern_file.endswith('.py') or not os.path.isfile(pattern_file):
+        parser.error('PATTERN_HMM must be a valid patternHmm model file.')
     try:
-        model_path, model_name = os.path.split(model_file)
+        model_path, model_name = os.path.split(pattern_file)
         sys.path.append(model_path)
         model_module = __import__(model_name[:-3])
     except (ImportError, AttributeError):
-        parser.error("the model could not be imported from %s."%model_file)
-    if not os.path.isfile(genome_file): parser.error('genome_file must point at a fasta formatted sequence file')
-    return model_module, genome_file, os.path.realpath(genome_mast_dir)
-
-def create_model_file(model_len, model_path, min_matches, max_genome_region, meme_file):
-    if max_genome_region == 0: max_genome_region = 40000
-    mm_str = 'min_matches = %i' % min_matches
-    ms_str = 'max_genome_region = %i' % max_genome_region
-    mf_str = "meme_file = '%s'" % meme_file
-    attribs_str = '\n'.join((mm_str, ms_str, mf_str))
-    generate_model_file(model_len, model_path, attribs_str)
-
-def main():
-    parser = setup_parser()
-    (options, args) = parser.parse_args()
-
-    # Validate options and arguments
-    min_matches, max_genome_region, meme_file = validate_model_options(parser, options)
-    new_model_len = options.make_model
-    if new_model_len: # Generate model file or run FiGMoP?
-        if new_model_len < 2:
-            parser.error('the length of the model file must be > 1')
-        create_model_file(new_model_len, options.new_model_path, min_matches, max_genome_region, meme_file)
-        return
-
+        parser.error("the model could not be imported from %s." % pattern_file)
+    if not os.path.isfile(genome_file): parser.error('GENOME_FILE must be a FASTA formatted sequence file')
+    return genome_file, os.path.realpath(genome_mast_dir), model_module
+def validate_genome_options2(model_module, min_matches, max_genome_region, meme_file, parser, options):
     sequence_padding = options.sequence_padding
     if sequence_padding < 0: parser.error('sequence_padding must be >= 0')
-    e_value = options.e_value
-    if e_value <= 0: parser.error('e_value must be >= 0')
-    model_module, genome_file, genome_mast_dir = validate_run_options(parser, args)
-    model = model_module.model
     if not min_matches:
         min_matches = getattr(model_module, 'min_matches', 0)
     if not max_genome_region:
@@ -369,16 +394,40 @@ def main():
         meme_file = getattr(model_module, 'meme_file', '')
         if not meme_file or not os.path.isfile(meme_file):
             parser.error("a MEME file must be provided in the model file or at the command line, but none was found at '%s'" % meme_file)
+    return sequence_padding, min_matches, max_genome_region, meme_file, model_module.model
 
-    if not os.path.isdir(genome_mast_dir) or not os.path.isfile(os.path.join(genome_mast_dir, options.default_mast_xml)):  # Run MAST on the genome before running FiGMoP
-        print "\nRunning MAST on the sequence file '%s' using the motifs from the MEME file '%s'\n" % (genome_file, meme_file)
-        run_mast(meme_file, genome_file, genome_mast_dir, 1000)
-    # Run FiGMoP
-    print "\nRunning FiGMoP on the genomic motifs from '%s' using the model file '%s'\n" % (genome_mast_dir, args[0])
-    patterns = MotifPatterns(genome_mast_dir, model, genome_file, min_matches,
-                                    sequence_padding)
-    patterns.run_mast_on_patterns(meme_file, max_genome_region, e_value,
-                                  options.output_dir, options.hits_filename)
 
+def main():
+    parser = setup_parser()
+    (options, args) = parser.parse_args()
+    # Validate some initial options and arguments
+    e_value, min_matches, max_genome_region, meme_file = validate_model_options(parser, options)
+    new_model_len, prot_file = options.generate_pattern_file, options.prot_file
+    
+    if prot_file:       ###  Mode 1: Run Figmop on protein sequences.
+        prot_file, meme_file = validate_prot_options(prot_file, parser, args)
+        run_mast(meme_file, prot_file, options.output_dir, e_value, False)
+        output_seq_file = os.path.join(options.output_dir, options.hits_filename)
+        extract_seqs(options.output_dir, prot_file, output_seq_file)
+    elif new_model_len: ###  Mode 2: Generate a new pattern file.
+        if new_model_len < 2:
+            parser.error('the length of the model file must be > 1')
+        pattern_file = options.pattern_file_path
+        if not pattern_file.endswith('.py'): pattern_file += '.py'
+        create_pattern_file(new_model_len, pattern_file, min_matches, max_genome_region, meme_file)
+        return
+    else:               ###  Mode 3: Run Figmop on a genome.
+        genome_file, genome_mast_dir, model_module = validate_genome_options1(parser, args)
+        sequence_padding, min_matches, max_genome_region, meme_file, model = validate_genome_options2(model_module, min_matches, max_genome_region, meme_file, parser, options)
+        #  Run MAST on the genome file:
+        if not os.path.isdir(genome_mast_dir) or not os.path.isfile(os.path.join(genome_mast_dir, options.default_mast_xml)):  # Run MAST on the genome before running FiGMoP
+            print "\nRunning MAST on the sequence file '%s' using the motifs from the MEME file '%s'\n" % (genome_file, meme_file)
+            run_mast(meme_file, genome_file, genome_mast_dir, 1000)
+        # Find patterns of sequence motifs:
+        print "\nRunning FiGMoP on the genomic motifs from '%s' using the pattern file '%s'\n" % (genome_mast_dir, args[0])
+        patterns = MotifPatterns(genome_mast_dir, model, genome_file, min_matches,
+                                        sequence_padding)
+        patterns.run_mast_on_patterns(meme_file, max_genome_region, e_value,
+                                      options.output_dir, options.hits_filename)
 if __name__ == "__main__":
     main()
